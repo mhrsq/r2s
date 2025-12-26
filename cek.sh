@@ -5,9 +5,8 @@ VERSION="0.2.0"
 TOOL_NAME="nextjs-whitebox-audit"
 
 OUT_FILE="result.json"
-OUT_HARDCODE="result_hardcode.txt"
 OUT_VULN="result_vuln.txt"
-OUT_RAW_LOCAL="result_hardcode.txt"
+OUT_RAW_LOCAL="result_raw.txt"
 ROOT="."
 SEND_TELEGRAM=1
 SKIP_DEPS=0
@@ -107,7 +106,7 @@ parse_args() {
         OUT_FILE="${2:-}"; shift 2 || true
         ;;
       --out-hardcode)
-        OUT_HARDCODE="${2:-}"; shift 2 || true
+        OUT_RAW_LOCAL="${2:-}"; shift 2 || true
         ;;
       --out-vuln)
         OUT_VULN="${2:-}"; shift 2 || true
@@ -1507,8 +1506,8 @@ main() {
     scan_runtime_domains "set" "$(set 2>/dev/null || true)"
   fi
 
-  write_text_report "$HARD_FINDINGS_JSONL" "$OUT_HARDCODE"
-  send_phase_report "Hardcoded Secrets Scan" "$HARD_FINDINGS_JSONL" "$OUT_HARDCODE"
+  write_text_report "$HARD_FINDINGS_JSONL" "$OUT_RAW_LOCAL"
+  send_phase_report "Hardcoded Secrets Scan" "$HARD_FINDINGS_JSONL" "$OUT_RAW_LOCAL"
 
   # Phase 2: Vulnerability patterns (optional)
   if (( SCAN_VULN == 1 )); then
