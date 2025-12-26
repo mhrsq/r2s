@@ -18,13 +18,15 @@ TELEGRAM_TEST=0
 UNSAFE_RAW_LOCAL=1
 TELEGRAM_BOT_TOKEN_DEFAULT="8368719709:AAH0xkCwgOApvV8q_JK-hboaGmRYv-TwicI"
 TELEGRAM_CHAT_ID_DEFAULT="828721892"
+SCAN_VULN=0
+SCAN_DOMAINS=0
 
 usage() {
   cat <<'USAGE'
 Next.js / React / RSC whitebox audit (secrets + risky patterns) -> result.json + Telegram (HTML).
 
 Usage:
-  tools/nextjs_whitebox_audit.sh [--root DIR] [--out FILE] [--out-hardcode FILE] [--out-vuln FILE] [--out-raw-local FILE] [--unsafe-raw-local] [--no-telegram] [--skip-deps] [--telegram-preview] [--telegram-test]
+  tools/nextjs_whitebox_audit.sh [--root DIR] [--out FILE] [--out-hardcode FILE] [--out-vuln FILE] [--out-raw-local FILE] [--unsafe-raw-local] [--scan-vuln] [--scan-domains] [--no-telegram] [--skip-deps] [--telegram-preview] [--telegram-test]
 
 Env (Telegram):
   TELEGRAM_BOT_TOKEN=...   (required unless --no-telegram)
@@ -35,7 +37,9 @@ Env (Telegram):
 Notes:
   - Output is always redacted (no raw secret values).
   - Designed for source review; findings are heuristic (false positives possible).
-  - Default behavior (no args): scan current directory tree, output result_hardcode.txt + result_vuln.txt, and send both to Telegram.
+  - Default behavior (no args): scan current directory tree for hardcoded credentials only and send result_hardcode.txt to Telegram.
+  - Use --scan-vuln to include risky code patterns and write/send result_vuln.txt.
+  - Use --scan-domains to include domain/base URL discovery from configs and runtime env.
   - --unsafe-raw-local writes raw values to a local file only (never sent to Telegram).
 USAGE
 }
@@ -113,6 +117,12 @@ parse_args() {
         ;;
       --unsafe-raw-local)
         UNSAFE_RAW_LOCAL=1; shift
+        ;;
+      --scan-vuln)
+        SCAN_VULN=1; shift
+        ;;
+      --scan-domains)
+        SCAN_DOMAINS=1; shift
         ;;
       --no-telegram)
         SEND_TELEGRAM=0; shift
@@ -477,6 +487,7 @@ for fp, rel in iter_files():
           continue
         ln = line_number(text, m.start())
         sn = line_snippet(text, m.start()).replace(val, redact_value(val))
+        add_raw(f"TOKEN {rel}:{ln} {val}")
         add_finding(mk_finding(
           r["severity"], r["category"], r["title"], rel, ln,
           " ".join(sn.split()),
@@ -822,6 +833,54 @@ cfg = {
       "scenario": "If valid, an attacker can abuse Stripe APIs within key permissions (payments, refunds, data access).",
       "recommendation": "Rotate the key, restrict it if possible, and keep it server-side only.",
       "confidence": "high",
+    },
+    {
+      "kind": "token",
+      "severity": "high",
+      "category": "secrets",
+      "title": "Possible OpenAI API key",
+      "match_type": "openai_key",
+      "regex": r"\bsk-(?:proj-)?[A-Za-z0-9]{20,}\b",
+      "globs": ["**/*.js","**/*.jsx","**/*.ts","**/*.tsx","**/*.mjs","**/*.cjs","**/*.json","**/.env*"],
+      "scenario": "If valid, an attacker can call OpenAI APIs within the key's scope and incur cost or data exposure.",
+      "recommendation": "Rotate the key, keep it server-side, and store it in a secret manager.",
+      "confidence": "medium",
+    },
+    {
+      "kind": "token",
+      "severity": "high",
+      "category": "secrets",
+      "title": "Possible Anthropic/Claude API key",
+      "match_type": "anthropic_key",
+      "regex": r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b",
+      "globs": ["**/*.js","**/*.jsx","**/*.ts","**/*.tsx","**/*.mjs","**/*.cjs","**/*.json","**/.env*"],
+      "scenario": "If valid, an attacker can call Anthropic APIs within the key's scope.",
+      "recommendation": "Rotate the key, keep it server-side, and store it in a secret manager.",
+      "confidence": "high",
+    },
+    {
+      "kind": "token",
+      "severity": "high",
+      "category": "secrets",
+      "title": "Possible PayPal access token",
+      "match_type": "paypal_access_token",
+      "regex": r"\bA21AA[0-9A-Za-z\-_]{20,}\b",
+      "globs": ["**/*.js","**/*.jsx","**/*.ts","**/*.tsx","**/*.mjs","**/*.cjs","**/*.json","**/.env*"],
+      "scenario": "If valid, an attacker can access PayPal APIs within the token's scope.",
+      "recommendation": "Rotate tokens and store secrets in a secure vault/secret manager.",
+      "confidence": "medium",
+    },
+    {
+      "kind": "token",
+      "severity": "high",
+      "category": "secrets",
+      "title": "Provider API key in env/config (OpenAI/Gemini/Anthropic/DeepSeek/PayPal)",
+      "match_type": "provider_key_var",
+      "regex": r"(?i)\b(OPENAI|GEMINI|ANTHROPIC|CLAUDE|DEEPSEEK|PAYPAL)_(API_)?(KEY|SECRET|CLIENT_ID|CLIENT_SECRET|TOKEN)\b\s*[:=]\s*[\"']([^\"'\n]{6,})[\"']",
+      "globs": ["**/*.js","**/*.jsx","**/*.ts","**/*.tsx","**/*.mjs","**/*.cjs","**/*.json","**/*.yml","**/*.yaml","**/.env*"],
+      "scenario": "Hardcoded provider credentials can be extracted and abused for API calls or account access.",
+      "recommendation": "Move to server-side env/secret manager and rotate exposed credentials.",
+      "confidence": "medium",
     },
     {
       "kind": "token",
@@ -1421,6 +1480,9 @@ main() {
   layout="$(detect_next_layout)"
   git_json="$(git_meta_json)"
 
+  if (( SCAN_VULN == 0 )); then
+    SKIP_DEPS=1
+  fi
   deps_json_file="$TMPDIR/deps_audit.json"
   audit_deps "$deps_json_file"
   deps_json="$(cat "$deps_json_file" 2>/dev/null || printf '{}')"
@@ -1433,23 +1495,31 @@ main() {
   fi
   : >"$FINDINGS_JSONL"
   scan_secrets
-  scan_domains
+  if (( SCAN_DOMAINS == 1 )); then
+    scan_domains
+  fi
 
   log "Scanning runtime variables via env/set (redacted)..."
   scan_runtime_vars "env" "$(env 2>/dev/null || true)"
   scan_runtime_vars "set" "$(set 2>/dev/null || true)"
-  scan_runtime_domains "env" "$(env 2>/dev/null || true)"
-  scan_runtime_domains "set" "$(set 2>/dev/null || true)"
+  if (( SCAN_DOMAINS == 1 )); then
+    scan_runtime_domains "env" "$(env 2>/dev/null || true)"
+    scan_runtime_domains "set" "$(set 2>/dev/null || true)"
+  fi
 
   write_text_report "$HARD_FINDINGS_JSONL" "$OUT_HARDCODE"
   send_phase_report "Hardcoded Secrets Scan" "$HARD_FINDINGS_JSONL" "$OUT_HARDCODE"
 
-  # Phase 2: Vulnerability patterns
-  FINDINGS_JSONL="$VULN_FINDINGS_JSONL"
-  : >"$FINDINGS_JSONL"
-  scan_risky_patterns
-  write_text_report "$VULN_FINDINGS_JSONL" "$OUT_VULN"
-  send_phase_report "Vulnerability Pattern Scan" "$VULN_FINDINGS_JSONL" "$OUT_VULN"
+  # Phase 2: Vulnerability patterns (optional)
+  if (( SCAN_VULN == 1 )); then
+    FINDINGS_JSONL="$VULN_FINDINGS_JSONL"
+    : >"$FINDINGS_JSONL"
+    scan_risky_patterns
+    write_text_report "$VULN_FINDINGS_JSONL" "$OUT_VULN"
+    send_phase_report "Vulnerability Pattern Scan" "$VULN_FINDINGS_JSONL" "$OUT_VULN"
+  else
+    : >"$VULN_FINDINGS_JSONL"
+  fi
 
   log "Writing $OUT_FILE ..."
   cat "$HARD_FINDINGS_JSONL" "$VULN_FINDINGS_JSONL" >"$FINDINGS_JSONL"
